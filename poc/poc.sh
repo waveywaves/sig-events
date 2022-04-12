@@ -10,6 +10,8 @@ declare BROKER_NAME
 
 export KO_DOCKER_REPO=kind.local
 
+export GOPATH=~/go
+
 # This script deploys all the software components required for the PoC
 # on a local laptop running docker.
 # It creates a kind cluster named cde and deploys to it:
@@ -30,8 +32,8 @@ export KO_DOCKER_REPO=kind.local
 # - tkn CLI (https://github.com/tektoncd/cli)
 # - keptn CLI (`curl -sL https://get.keptn.sh | bash`)
 # - keptn inbound/outbound adapters and tekton cloudevent controller
-#   https://github.com/salaboy/cdf-events-keptn-adapter - inbound
-#   https://github.com/salaboy/keptn-cdf-translator - outbound
+#   https://github.com/waveywaves/cdf-events-keptn-adapter - inbound
+#   https://github.com/waveywaves/keptn-cdf-translator - outbound
 #   https://github.com/tektoncd/experimental - contains tekton cloudevent controller
 #   should be cloned under $GOROOT/src/github.com/<org>/<repo> or alternatively
 #   the corresponding PATH environment variables must be set (see the declare section above)
@@ -98,18 +100,18 @@ if [ -z "$TEKTON_DASHBOARD_VERSION" ]; then
   TEKTON_DASHBOARD_VERSION=$(get_latest_release tektoncd/dashboard)
 fi
 
-KNATIVE_VERSION=${KNATIVE_VERSION:-0.24.0}
+KNATIVE_VERSION=${KNATIVE_VERSION:-1.3.0}
 
 echo "Checking if needed repos can be found"
-if [ ! -d "${KEPTN_CDF_TRANSLATOR_PATH:-${GOPATH}/src/github.com/salaboy/keptn-cdf-translator}" ]
+if [ ! -d "${KEPTN_CDF_TRANSLATOR_PATH:-${GOPATH}/src/github.com/waveywaves/keptn-cdf-translator}" ]
 then
-    echo "Can not find required repo: github.com/salaboy/keptn-cdf-translator"
+    echo "Can not find required repo: github.com/waveywaves/keptn-cdf-translator"
     exit 1 # die with error code 1
 fi
 
-if [ ! -d "${CDF_EVENTS_KEPTN_ADAPTER_PATH:-${GOPATH}/src/github.com/salaboy/cdf-events-keptn-adapter}" ]
+if [ ! -d "${CDF_EVENTS_KEPTN_ADAPTER_PATH:-${GOPATH}/src/github.com/waveywaves/cdf-events-keptn-adapter}" ]
 then
-    echo "Can not find required repo: github.com/salaboy/cdf-events-keptn-adapter"
+    echo "Can not find required repo: github.com/waveywaves/cdf-events-keptn-adapter"
     exit 1 # die with error code 1
 fi
 
@@ -191,18 +193,142 @@ docker network connect "kind" "${reg_name}" || true
 
 # Knative (serving only for now)
 echo "===> Deploying Knative controller"
-export KNATIVE_VERSION
-curl -sL https://raw.githubusercontent.com/csantanapr/knative-kind/master/02-serving.sh | bash
+# export KNATIVE_VERSION
+set -eo pipefail
+set -u
+
+# KNATIVE_VERSION=${KNATIVE_VERSION:-1.2.2}
+
+n=0
+set +e
+until [ $n -ge 2 ]; do
+	  kubectl apply -f https://github.com/knative/serving/releases/download/knative-v${KNATIVE_VERSION}/serving-crds.yaml > /dev/null && break
+	    echo "Serving CRDs failed to install on first try"
+	      n=$[$n+1]
+	        sleep 5
+	done
+	set -e
+	kubectl wait --for=condition=Established --all crd > /dev/null
+
+	n=0
+	set +e
+	until [ $n -ge 2 ]; do
+		  kubectl apply -f https://github.com/knative/serving/releases/download/knative-v${KNATIVE_VERSION}/serving-core.yaml > /dev/null && break
+		    echo "Serving Core failed to install on first try"
+		      n=$[$n+1]
+		        sleep 5
+		done
+		set -e
+		kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-serving > /dev/null
 
 echo "===> Deploying Contour"
 export KNATIVE_NET_CONTOUR_VERSION=${KNATIVE_NET_CONTOUR_VERSION:-$KNATIVE_VERSION}
-curl -sL https://raw.githubusercontent.com/csantanapr/knative-kind/master/02-contour.sh | bash
+set -eo pipefail
+set -u
+
+## INSTALL CONTOUR
+n=0
+until [ $n -ge 2 ]; do
+	  kubectl apply -f https://github.com/knative-sandbox/net-contour/releases/download/knative-v${KNATIVE_NET_CONTOUR_VERSION}/contour.yaml > /dev/null && break
+	    n=$[$n+1]
+	      sleep 5
+      done
+      kubectl wait --for=condition=Established --all crd > /dev/null
+      kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n contour-internal > /dev/null
+      kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n contour-external > /dev/null
+
+      ## INSTALL NET CONTOUR
+      n=0
+      until [ $n -ge 2 ]; do
+	        kubectl apply -f https://github.com/knative-sandbox/net-contour/releases/download/knative-v${KNATIVE_NET_CONTOUR_VERSION}/net-contour.yaml > /dev/null && break
+		  n=$[$n+1]
+		    sleep 5
+	    done
+	    # deployment for net-contour gets deployed to namespace knative-serving
+	    kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-serving > /dev/null
+
+	    # Configure Knative to use this ingress
+	    kubectl patch configmap/config-network \
+		      --namespace knative-serving \
+		        --type merge \
+			  --patch '{"data":{"ingress.class":"contour.ingress.networking.knative.dev"}}'
+
+
+	    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: contour-ingress
+  namespace: contour-external
+  labels:
+    networking.knative.dev/ingress-provider: contour
+spec:
+  type: NodePort
+  selector:
+    app: envoy
+  ports:
+    - name: http
+      nodePort: 31080
+      port: 80
+      targetPort: 8080
+EOF
+
 
 echo "===> Deploying Knative Serving"
 export KNATIVE_EVENTING_VERSION=${KNATIVE_EVENTING_VERSION:-$KNATIVE_VERSION}
 export BROKER_NAME=${BROKER_NAME:-"events-broker"}
 kubectl delete "broker/${BROKER_NAME}" > /dev/null || true
-curl -sL https://raw.githubusercontent.com/csantanapr/knative-kind/master/04-eventing.sh | bash
+
+NAMESPACE=${NAMESPACE:-default}
+BROKER_NAME=${BROKER_NAME:-example-broker}
+
+n=0
+until [ $n -ge 2 ]; do
+	  kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v${KNATIVE_EVENTING_VERSION}/eventing-crds.yaml > /dev/null && break
+	    echo "Eventing CRDs failed to install on first try"
+	      n=$[$n+1]
+  sleep 5
+done
+kubectl wait --for=condition=Established --all crd > /dev/null
+
+n=0
+until [ $n -ge 2 ]; do
+  kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v${KNATIVE_EVENTING_VERSION}/eventing-core.yaml > /dev/null && break
+  echo "Eventing Core failed to install on first try"
+  n=$[$n+1]
+  sleep 5
+done
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-eventing > /dev/null
+
+n=0
+until [ $n -ge 2 ]; do
+  kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v${KNATIVE_EVENTING_VERSION}/in-memory-channel.yaml > /dev/null && break
+  echo "Eventing Memory Channel failed to install on first try"
+  n=$[$n+1]
+  sleep 5
+done
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-eventing > /dev/null
+
+n=0
+until [ $n -ge 2 ]; do
+  kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v${KNATIVE_EVENTING_VERSION}/mt-channel-broker.yaml > /dev/null && break
+  echo "Eventing MT Memory Broker failed to install on first try"
+  n=$[$n+1]
+  sleep 5
+done
+kubectl wait pod --timeout=-1s --for=condition=Ready -l '!job-name' -n knative-eventing > /dev/null
+
+
+kubectl apply -f - <<EOF
+apiVersion: eventing.knative.dev/v1
+kind: broker
+metadata:
+ name: ${BROKER_NAME}
+ namespace: ${NAMESPACE}
+EOF
+
+sleep 10
+kubectl -n ${NAMESPACE} get broker ${BROKER_NAME}
 
 EXTERNAL_IP="127.0.0.1"
 KNATIVE_DOMAIN="knative-$EXTERNAL_IP.nip.io"
@@ -301,14 +427,14 @@ echo "keptn configure bridge -o"
 # Install the keptn inbound and outbound adapters
 export GO111MODULE=on
 
-echo "===> Install Keptn Inboud"
-KEPTN_CDF_TRANSLATOR_PATH=${KEPTN_CDF_TRANSLATOR_PATH:-${GOPATH}/src/github.com/salaboy/keptn-cdf-translator}
+echo "===> Install Keptn Inbound"
+KEPTN_CDF_TRANSLATOR_PATH=${KEPTN_CDF_TRANSLATOR_PATH:-${GOPATH}/src/github.com/waveywaves/keptn-cdf-translator}
 pushd "$KEPTN_CDF_TRANSLATOR_PATH"
 ko apply -f config/
 popd
 
 echo "===> Install Keptn Outbound"
-CDF_EVENTS_KEPTN_ADAPTER_PATH=${CDF_EVENTS_KEPTN_ADAPTER_PATH:-${GOPATH}/src/github.com/salaboy/cdf-events-keptn-adapter}
+CDF_EVENTS_KEPTN_ADAPTER_PATH=${CDF_EVENTS_KEPTN_ADAPTER_PATH:-${GOPATH}/src/github.com/waveywaves/cdf-events-keptn-adapter}
 pushd "$CDF_EVENTS_KEPTN_ADAPTER_PATH"
 docker build --tag localhost:${reg_port}/cdevents/cdf-events-keptn-adapter:latest .
 docker push localhost:${reg_port}/cdevents/cdf-events-keptn-adapter:latest
